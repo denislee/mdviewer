@@ -2,10 +2,13 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"image"
 	"image/color"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -44,6 +47,10 @@ var (
 	colCodeFg   = color.NRGBA{R: 0x33, G: 0x33, B: 0x33, A: 0xff}
 	colQuoteBar = color.NRGBA{R: 0xb0, G: 0xb0, B: 0xb0, A: 0xff}
 	colRule     = color.NRGBA{R: 0xcc, G: 0xcc, B: 0xcc, A: 0xff}
+	colPanel    = color.NRGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff}
+	colScrim    = color.NRGBA{R: 0x00, G: 0x00, B: 0x00, A: 0x80}
+	colErr      = color.NRGBA{R: 0xc0, G: 0x20, B: 0x20, A: 0xff}
+	colOk       = color.NRGBA{R: 0x20, G: 0x80, B: 0x40, A: 0xff}
 )
 
 func main() {
@@ -80,6 +87,8 @@ func run(title string, blocks []block) error {
 	var ops op.Ops
 	list := &widget.List{List: layout.List{Axis: layout.Vertical}}
 	vs := &vimState{}
+	st := &settingsState{}
+	st.toggle.Value = isDefaultViewer()
 
 	for {
 		switch e := w.Event().(type) {
@@ -92,7 +101,7 @@ func run(title string, blocks []block) error {
 			area := clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops)
 			event.Op(gtx.Ops, vs)
 			gtx.Execute(key.FocusCmd{Tag: vs})
-			handleKeys(gtx, list, vs, len(blocks), w)
+			handleKeys(gtx, list, vs, st, len(blocks), w)
 			area.Pop()
 
 			paint.Fill(gtx.Ops, colBg)
@@ -104,6 +113,10 @@ func run(title string, blocks []block) error {
 					return blocks[i].layout(gtx, th)
 				})
 			})
+
+			if st.open {
+				layoutSettings(gtx, th, st)
+			}
 
 			e.Frame(gtx.Ops)
 		}
@@ -118,7 +131,7 @@ type vimState struct {
 	lastG bool
 }
 
-func handleKeys(gtx C, list *widget.List, vs *vimState, n int, w *app.Window) {
+func handleKeys(gtx C, list *widget.List, vs *vimState, st *settingsState, n int, w *app.Window) {
 	filters := []event.Filter{
 		key.FocusFilter{Target: vs},
 		key.Filter{Name: "J", Optional: key.ModShift | key.ModCtrl},
@@ -129,6 +142,7 @@ func handleKeys(gtx C, list *widget.List, vs *vimState, n int, w *app.Window) {
 		key.Filter{Name: "F", Optional: key.ModCtrl},
 		key.Filter{Name: "B", Optional: key.ModCtrl},
 		key.Filter{Name: "Q"},
+		key.Filter{Name: ","},
 		key.Filter{Name: key.NameSpace, Optional: key.ModShift},
 		key.Filter{Name: key.NameHome},
 		key.Filter{Name: key.NameEnd},
@@ -152,6 +166,23 @@ func handleKeys(gtx C, list *widget.List, vs *vimState, n int, w *app.Window) {
 		}
 		shift := ke.Modifiers.Contain(key.ModShift)
 		ctrl := ke.Modifiers.Contain(key.ModCtrl)
+		if ke.Name == "," {
+			st.open = !st.open
+			if st.open {
+				st.toggle.Value = isDefaultViewer()
+				st.msg = ""
+			}
+			vs.lastG = false
+			w.Invalidate()
+			continue
+		}
+		if st.open {
+			if ke.Name == key.NameEscape || ke.Name == "Q" {
+				st.open = false
+				w.Invalidate()
+			}
+			continue
+		}
 		switch ke.Name {
 		case "J", key.NameDownArrow:
 			list.ScrollBy(0.25)
@@ -532,4 +563,200 @@ func nodeText(n ast.Node, src []byte) string {
 		sb.Write(line.Value(src))
 	}
 	return sb.String()
+}
+
+// -----------------------------------------------------------------------------
+// Settings overlay
+// -----------------------------------------------------------------------------
+
+const desktopFileName = "mdviewer.desktop"
+
+var mdMimeTypes = []string{"text/markdown", "text/x-markdown"}
+
+type settingsState struct {
+	open   bool
+	toggle widget.Bool
+	msg    string
+	msgErr bool
+}
+
+func layoutSettings(gtx C, th *material.Theme, st *settingsState) D {
+	if st.toggle.Update(gtx) {
+		var err error
+		if st.toggle.Value {
+			err = enableDefaultViewer()
+		} else {
+			err = disableDefaultViewer()
+		}
+		if err != nil {
+			st.msg = err.Error()
+			st.msgErr = true
+			st.toggle.Value = isDefaultViewer()
+		} else {
+			st.msgErr = false
+			if st.toggle.Value {
+				st.msg = "Registered as default .md viewer."
+			} else {
+				st.msg = "No longer the default .md viewer."
+			}
+		}
+	}
+
+	// Scrim that also captures clicks behind the panel.
+	scrimRect := clip.Rect{Max: gtx.Constraints.Max}.Push(gtx.Ops)
+	paint.ColorOp{Color: colScrim}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	scrimRect.Pop()
+
+	return layout.Center.Layout(gtx, func(gtx C) D {
+		gtx.Constraints.Max.X = gtx.Dp(unit.Dp(440))
+		gtx.Constraints.Min.X = gtx.Constraints.Max.X
+		macro := op.Record(gtx.Ops)
+		dims := layout.UniformInset(unit.Dp(22)).Layout(gtx, func(gtx C) D {
+			return layout.Flex{Axis: layout.Vertical, Spacing: layout.SpaceEnd}.Layout(gtx,
+				layout.Rigid(func(gtx C) D {
+					title := material.Label(th, unit.Sp(20), "Settings")
+					title.Font.Weight = font.Bold
+					return title.Layout(gtx)
+				}),
+				layout.Rigid(layout.Spacer{Height: unit.Dp(16)}.Layout),
+				layout.Rigid(func(gtx C) D {
+					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+						layout.Flexed(1, func(gtx C) D {
+							return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+								layout.Rigid(material.Label(th, unit.Sp(15), "Default viewer for .md files").Layout),
+								layout.Rigid(func(gtx C) D {
+									sub := material.Label(th, unit.Sp(12), "Registers a desktop entry and updates xdg-mime.")
+									sub.Color = colMuted
+									return sub.Layout(gtx)
+								}),
+							)
+						}),
+						layout.Rigid(material.Switch(th, &st.toggle, "default md viewer").Layout),
+					)
+				}),
+				layout.Rigid(layout.Spacer{Height: unit.Dp(14)}.Layout),
+				layout.Rigid(func(gtx C) D {
+					if st.msg == "" {
+						return D{}
+					}
+					lbl := material.Label(th, unit.Sp(13), st.msg)
+					if st.msgErr {
+						lbl.Color = colErr
+					} else {
+						lbl.Color = colOk
+					}
+					return lbl.Layout(gtx)
+				}),
+				layout.Rigid(layout.Spacer{Height: unit.Dp(18)}.Layout),
+				layout.Rigid(func(gtx C) D {
+					hint := material.Label(th, unit.Sp(12), "press , or Esc to close")
+					hint.Color = colMuted
+					return hint.Layout(gtx)
+				}),
+			)
+		})
+		call := macro.Stop()
+		rect := image.Rectangle{Max: dims.Size}
+		rr := clip.UniformRRect(rect, gtx.Dp(unit.Dp(10)))
+		paint.FillShape(gtx.Ops, colPanel, rr.Op(gtx.Ops))
+		call.Add(gtx.Ops)
+		return dims
+	})
+}
+
+func desktopDir() string {
+	if d := os.Getenv("XDG_DATA_HOME"); d != "" {
+		return filepath.Join(d, "applications")
+	}
+	return filepath.Join(os.Getenv("HOME"), ".local", "share", "applications")
+}
+
+func desktopFilePath() string {
+	return filepath.Join(desktopDir(), desktopFileName)
+}
+
+func mimeappsPath() string {
+	if d := os.Getenv("XDG_CONFIG_HOME"); d != "" {
+		return filepath.Join(d, "mimeapps.list")
+	}
+	return filepath.Join(os.Getenv("HOME"), ".config", "mimeapps.list")
+}
+
+func isDefaultViewer() bool {
+	if _, err := os.Stat(desktopFilePath()); err != nil {
+		return false
+	}
+	for _, mt := range mdMimeTypes {
+		out, err := exec.Command("xdg-mime", "query", "default", mt).Output()
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(out)) == desktopFileName {
+			return true
+		}
+	}
+	return false
+}
+
+func enableDefaultViewer() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate executable: %w", err)
+	}
+	dir := desktopDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+	content := fmt.Sprintf(`[Desktop Entry]
+Type=Application
+Name=mdviewer
+GenericName=Markdown Viewer
+Comment=Wayland-native Markdown viewer
+Exec=%s %%f
+Terminal=false
+NoDisplay=false
+MimeType=text/markdown;text/x-markdown;
+Categories=Utility;Viewer;TextTools;
+`, exe)
+	if err := os.WriteFile(desktopFilePath(), []byte(content), 0o644); err != nil {
+		return fmt.Errorf("write desktop file: %w", err)
+	}
+	_ = exec.Command("update-desktop-database", dir).Run()
+	for _, mt := range mdMimeTypes {
+		if err := exec.Command("xdg-mime", "default", desktopFileName, mt).Run(); err != nil {
+			return fmt.Errorf("xdg-mime default %s: %w", mt, err)
+		}
+	}
+	return nil
+}
+
+func disableDefaultViewer() error {
+	path := mimeappsPath()
+	if data, err := os.ReadFile(path); err == nil {
+		lines := strings.Split(string(data), "\n")
+		kept := make([]string, 0, len(lines))
+		for _, ln := range lines {
+			drop := false
+			for _, mt := range mdMimeTypes {
+				if strings.HasPrefix(ln, mt+"=") && strings.Contains(ln, desktopFileName) {
+					drop = true
+					break
+				}
+			}
+			if !drop {
+				kept = append(kept, ln)
+			}
+		}
+		if err := os.WriteFile(path, []byte(strings.Join(kept, "\n")), 0o644); err != nil {
+			return fmt.Errorf("update %s: %w", path, err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	if err := os.Remove(desktopFilePath()); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove desktop file: %w", err)
+	}
+	_ = exec.Command("update-desktop-database", desktopDir()).Run()
+	return nil
 }

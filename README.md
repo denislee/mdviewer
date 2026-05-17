@@ -31,7 +31,18 @@ go build -o mdviewer .
 | `Ctrl-b` / `PgUp` | page up              |
 | `gg` / `Home`  | jump to top             |
 | `G` / `End`    | jump to bottom          |
+| `,`            | open / close settings   |
 | `q`            | quit                    |
+
+## Settings
+
+Press `,` to open the settings overlay. It currently exposes a single
+toggle: *Default viewer for .md files*. Enabling it writes
+`~/.local/share/applications/mdviewer.desktop` pointing at the running
+binary and runs `xdg-mime default mdviewer.desktop` for `text/markdown`
+and `text/x-markdown`. Disabling removes those entries from
+`mimeapps.list` and deletes the desktop file. Press `,` or `Esc` to
+close the overlay.
 
 ## Rendering support
 
